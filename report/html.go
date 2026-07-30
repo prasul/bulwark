@@ -5,6 +5,7 @@ import (
 	"html"
 	"os"
 	"strings"
+
 	"time"
 
 	"github.com/prasul/wpscan/scanner"
@@ -185,6 +186,13 @@ body{font-family:'Google Sans','Roboto',Arial,sans-serif;font-size:14px;color:va
 <div class="summary-card sc-red"><div class="sc-value">%d</div><div class="sc-label">With Issues</div></div>
 <div class="summary-card sc-yellow"><div class="sc-value">%d</div><div class="sc-label">Total Findings</div></div>
 </div>`, summary.TotalSites, summary.CleanSites, affected, summary.TotalIssues)
+
+	// ── Host-level findings (server crontab, etc — not scoped to one site)
+	if len(summary.HostFindings) > 0 {
+		fmt.Fprint(f, `<div class="section-title">Host-Level Findings</div><div class="site-card"><div class="site-card-body" style="display:block">`)
+		writeFindingsTable(f, summary.HostFindings)
+		fmt.Fprint(f, `</div></div>`)
+	}
 
 	// ── Per-site cards
 	fmt.Fprint(f, `<div class="section-title">Per-Site Findings</div>`)

@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io/fs"
 	"os"
@@ -886,6 +887,158 @@ func CheckHighRiskPluginsAndSnippets(pubDir string, findings *[]Finding) {
 			Detail: fmt.Sprintf(
 				"Snippet payload stored in wp_options (%s) — inspect with: wp eval 'global $wpdb; echo $wpdb->get_var(\"SELECT option_value FROM %s WHERE option_name = \\\"%s\\\"\");' — remove with: wp db query \"DELETE FROM %s WHERE option_name='%s'\"",
 				key, optionsTable, key, optionsTable, key),
+		})
+	}
+}
+
+// ──────────────────────────────────────────────
+// CHECK: PHP payloads embedded inside real image files
+// ──────────────────────────────────────────────
+
+// imageMarkers are byte sequences that have no business appearing inside
+// a genuine JPG/PNG/GIF/ICO — unlike the disguised-file check above (which
+// only catches filename tricks like shell.php.jpg), this opens files that
+// pass a real image extension and looks for a payload appended or injected
+// into the file body itself.
+var imageMarkers = [][]byte{
+	[]byte("<?php"),
+	[]byte("<?="),
+	[]byte("eval("),
+	[]byte("base64_decode("),
+}
+
+const maxImageScanSize = 20 * 1024 * 1024 // skip anything absurdly large
+
+func CheckImageEmbeddedPHP(pubDir string, findings *[]Finding) {
+	uploadsDir := filepath.Join(pubDir, "wp-content", "uploads")
+	imageExts := map[string]bool{
+		".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".ico": true,
+	}
+
+	filepath.WalkDir(uploadsDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(d.Name()))
+		if !imageExts[ext] {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || info.Size() > maxImageScanSize || info.Size() == 0 {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		for _, marker := range imageMarkers {
+			if bytes.Contains(data, marker) {
+				rel, _ := filepath.Rel(pubDir, path)
+				*findings = append(*findings, Finding{
+					Severity: Critical,
+					Check:    "Image Payload Scan",
+					Detail:   fmt.Sprintf("PHP code embedded inside image file (marker: %s) — valid extension, poisoned body", string(marker)),
+					File:     rel,
+				})
+				break
+			}
+		}
+		return nil
+	})
+}
+
+// ──────────────────────────────────────────────
+// CHECK: Server-level cron (host, not per-site)
+// ──────────────────────────────────────────────
+// wp cron event list only sees WordPress's own scheduler. A backdoor that
+// re-adds itself via the OS crontab survives a full WP reinstall and never
+// shows up there. This reads the actual system cron sources instead.
+
+var suspiciousCronPatterns = []PatternDef{
+	{Pattern: `curl[^|]*\|\s*(ba)?sh`, Desc: "curl piped directly into a shell"},
+	{Pattern: `wget[^|]*\|\s*(ba)?sh`, Desc: "wget piped directly into a shell"},
+	{Pattern: `base64\s+-d`, Desc: "base64 decode in cron entry"},
+	{Pattern: `php\s+-r\s+["']`, Desc: "inline PHP one-liner (php -r)"},
+	{Pattern: `/tmp/[\w.\-]+\.(sh|php|py)`, Desc: "executable staged in /tmp"},
+	{Pattern: `(?i)\bnc\s+-e\b`, Desc: "netcat reverse-shell flag (-e)"},
+}
+
+func CheckServerCron(findings *[]Finding) {
+	patterns := compilePatterns(suspiciousCronPatterns)
+	seen := make(map[string]bool)
+
+	addEntry := func(source, line string) {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			return
+		}
+		key := source + "|" + line
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+
+		severity := Info
+		desc := ""
+		for _, p := range patterns {
+			if p.re.MatchString(line) {
+				severity = Critical
+				desc = p.desc
+				break
+			}
+		}
+		detail := fmt.Sprintf("Cron entry — review: %s", line)
+		if desc != "" {
+			detail = fmt.Sprintf("%s: %s", desc, line)
+		}
+		*findings = append(*findings, Finding{
+			Severity: severity,
+			Check:    "Server Cron Audit",
+			Detail:   detail,
+			File:     source,
+		})
+	}
+
+	readFile := func(path string) {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return
+		}
+		for _, l := range strings.Split(string(data), "\n") {
+			addEntry(path, l)
+		}
+	}
+
+	if os.Geteuid() == 0 {
+		// Root can see every user's crontab — this is where a persistence
+		// backdoor tied to a different system user (e.g. the PHP-FPM pool
+		// user, not root) would actually live.
+		readFile("/etc/crontab")
+		for _, dir := range []string{"/etc/cron.d", "/var/spool/cron/crontabs", "/var/spool/cron"} {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				continue
+			}
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				readFile(filepath.Join(dir, e.Name()))
+			}
+		}
+	} else {
+		// Not root — can only see our own crontab. Say so explicitly
+		// rather than silently reporting an incomplete picture.
+		out, err := exec.Command("crontab", "-l").Output()
+		if err == nil {
+			for _, l := range strings.Split(string(out), "\n") {
+				addEntry("crontab -l (current user)", l)
+			}
+		}
+		*findings = append(*findings, Finding{
+			Severity: Info,
+			Check:    "Server Cron Audit",
+			Detail:   "Not running as root — only the current user's crontab was checked. Run with sudo to audit every system user's cron (this is where a PHP-FPM-user backdoor would hide).",
 		})
 	}
 }

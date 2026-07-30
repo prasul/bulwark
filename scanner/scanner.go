@@ -27,6 +27,9 @@ func (s *Scanner) Run() (*ScanSummary, error) {
 		FailedChecks: make(map[string][]string),
 	}
 
+	// Host-level checks run once for the whole box, not once per site.
+	CheckServerCron(&summary.HostFindings)
+
 	entries, err := os.ReadDir(s.Config.BaseDir)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read base dir %s: %w", s.Config.BaseDir, err)
@@ -59,6 +62,11 @@ func (s *Scanner) Run() (*ScanSummary, error) {
 	}
 
 	summary.Duration = time.Since(start)
+	for _, hf := range summary.HostFindings {
+		if hf.Severity == Critical || hf.Severity == Warning {
+			summary.TotalIssues++
+		}
+	}
 	return summary, nil
 }
 
@@ -83,6 +91,9 @@ func (s *Scanner) scanSite(domain, siteDir, pubDir string) SiteResult {
 		}},
 		{"File Placement", func() {
 			CheckSuspiciousFiles(pubDir, &findings)
+		}},
+		{"Image Payload Scan", func() {
+			CheckImageEmbeddedPHP(pubDir, &findings)
 		}},
 		{"Recently Modified", func() {
 			CheckRecentlyModified(pubDir, s.Config.RecentDays, &findings)

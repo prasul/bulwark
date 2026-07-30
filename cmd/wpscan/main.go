@@ -11,7 +11,9 @@ import (
 	"github.com/prasul/wpscan/scanner"
 )
 
-const version = "3.0.0"
+// version is stamped at build time via -ldflags "-X main.version=vX.Y.Z"
+// by the release workflow. "dev" is what you get on a local `go build`.
+var version = "dev"
 
 func main() {
 	cfg := scanner.DefaultConfig()
@@ -24,7 +26,7 @@ func main() {
 
 	// Terminal banner
 	fmt.Printf("\n\033[1;36m╔══════════════════════════════════════════════╗\n")
-	fmt.Printf("║    WordPress Security Scanner v%s (Go)    ║\n", version)
+	fmt.Printf("║    WordPress Security Scanner %s (Go)    ║\n", version)
 	fmt.Printf("║    %s                ║\n", time.Now().Format("2006-01-02 15:04:05"))
 	fmt.Printf("╚══════════════════════════════════════════════╝\033[0m\n\n")
 
@@ -80,6 +82,24 @@ func printSummary(s *scanner.ScanSummary) {
 	}
 
 	fmt.Printf("\033[1;36m╚══════════════════════════════════════════════╝\033[0m\n\n")
+
+	if len(s.HostFindings) > 0 {
+		fmt.Printf("\033[1;35m● Host-level (server cron)\033[0m — %d finding(s)\n", len(s.HostFindings))
+		for _, f := range s.HostFindings {
+			icon := "ℹ"
+			if f.Severity == scanner.Critical {
+				icon = "✘"
+			} else if f.Severity == scanner.Warning {
+				icon = "⚠"
+			}
+			loc := ""
+			if f.File != "" {
+				loc = f.File + ": "
+			}
+			fmt.Printf("  %s [%s] %s%s\n", icon, f.Check, loc, f.Detail)
+		}
+		fmt.Println()
+	}
 
 	// Per-site detail
 	for _, site := range s.Sites {

@@ -41,6 +41,7 @@ type ScanSummary struct {
 	Duration     time.Duration
 	Sites        []SiteResult
 	FailedChecks map[string][]string // check name -> list of affected domains
+	HostFindings []Finding           // host-level checks that run once, not per-site (e.g. server crontab)
 }
 
 // Config holds scanner configuration

@@ -1,0 +1,66 @@
+# Builds static Linux binaries and publishes a GitHub Release whenever a
+# version tag (v1.2.3) is pushed. Centmin Mod / LEMP is the target
+# environment, so amd64 + arm64 Linux is what actually gets used —
+# nothing else is built.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Verify
+        run: |
+          go build -v ./...
+          go vet ./...
+          go test -v ./...
+
+      - name: Build binaries
+        env:
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          VERSION="${GITHUB_REF_NAME}"
+          for GOOS in linux; do
+            for GOARCH in amd64 arm64; do
+              VERSIONED="dist/wpscan-${VERSION}-${GOOS}-${GOARCH}"
+              STABLE="dist/wpscan-${GOOS}-${GOARCH}"
+              GOOS=$GOOS GOARCH=$GOARCH go build \
+                -ldflags "-s -w -X main.version=${VERSION}" \
+                -o "$VERSIONED" ./cmd/wpscan/
+              # Stable, unversioned copy — this is what a fixed
+              # /releases/latest/download/wpscan-linux-amd64 URL resolves to.
+              # Filename must stay identical release over release or the
+              # link breaks.
+              cp "$VERSIONED" "$STABLE"
+            done
+          done
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum wpscan-* > checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          make_latest: true
+          files: |
+            dist/wpscan-*
+            dist/checksums.txt
+          generate_release_notes: true
