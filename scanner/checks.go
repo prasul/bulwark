@@ -190,6 +190,17 @@ func CheckRecentlyModified(pubDir string, recentDays int, findings *[]Finding) {
 		}
 	}
 
+	// Collect raw hits first so we can spot plugin-update bursts before
+	// emitting findings — a single `wp plugin update` touches hundreds of
+	// built JS/PHP files with an identical mtime, and reporting each one
+	// individually is noise, not signal.
+	type hit struct {
+		rel      string
+		mtime    time.Time
+		severity Severity
+	}
+	var hits []hit
+
 	for _, dir := range suspiciousDirs {
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil || d.IsDir() {
@@ -213,16 +224,67 @@ func CheckRecentlyModified(pubDir string, recentDays int, findings *[]Finding) {
 				if strings.Contains(path, "uploads") && ext != ".js" {
 					severity = Critical
 				}
-				*findings = append(*findings, Finding{
-					Severity: severity,
-					Check:    "Recently Modified",
-					Detail:   fmt.Sprintf("File modified within %d days (mtime: %s)", recentDays, info.ModTime().Format("2006-01-02 15:04")),
-					File:     rel,
-				})
+				hits = append(hits, hit{rel: rel, mtime: info.ModTime(), severity: severity})
 			}
 			return nil
 		})
 	}
+
+	// Group by (top-level plugin/theme dir, mtime rounded to the minute).
+	// Bursts of >20 files sharing both collapse into one finding; PHP files
+	// in uploads never collapse since that combination is always Critical.
+	type groupKey struct {
+		root  string
+		stamp string
+	}
+	groups := make(map[groupKey][]hit)
+	for _, h := range hits {
+		if h.severity == Critical {
+			continue // never collapse the high-confidence uploads/PHP case
+		}
+		groups[groupKey{root: burstRoot(h.rel), stamp: h.mtime.Format("2006-01-02 15:04")}] = append(
+			groups[groupKey{root: burstRoot(h.rel), stamp: h.mtime.Format("2006-01-02 15:04")}], h)
+	}
+
+	collapsed := make(map[string]bool)
+	for key, group := range groups {
+		if len(group) > 20 {
+			for _, h := range group {
+				collapsed[h.rel] = true
+			}
+			*findings = append(*findings, Finding{
+				Severity: Info,
+				Check:    "Recently Modified",
+				Detail: fmt.Sprintf(
+					"%d files updated together within %d days (mtime: %s) — consistent with a plugin/theme release, not a targeted change. Verify the version bump if unexpected.",
+					len(group), recentDays, key.stamp),
+				File: key.root + "/",
+			})
+		}
+	}
+
+	for _, h := range hits {
+		if collapsed[h.rel] {
+			continue
+		}
+		*findings = append(*findings, Finding{
+			Severity: h.severity,
+			Check:    "Recently Modified",
+			Detail:   fmt.Sprintf("File modified within %d days (mtime: %s)", recentDays, h.mtime.Format("2006-01-02 15:04")),
+			File:     h.rel,
+		})
+	}
+}
+
+// burstRoot returns the plugin/theme/mu-plugin directory a relative path
+// belongs to (e.g. "wp-content/plugins/google-site-kit"), or the path
+// itself if it doesn't fit that shape. Used to group mtime bursts.
+func burstRoot(rel string) string {
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) >= 3 && parts[0] == "wp-content" {
+		return strings.Join(parts[:3], "/")
+	}
+	return rel
 }
 
 // ──────────────────────────────────────────────
@@ -724,6 +786,108 @@ func CheckPlugins(pubDir string, recentDays int, findings *[]Finding) {
 		}
 		return nil
 	})
+}
+
+// ──────────────────────────────────────────────
+// CHECK: PHP comment-hidden backdoors (<?php /*- ... )
+// ──────────────────────────────────────────────
+
+func CheckCommentBackdoors(pubDir string, findings *[]Finding) {
+	patterns := compilePatterns(PHPCommentBackdoorPatterns)
+	phpExts := map[string]bool{".php": true, ".php5": true, ".phtml": true}
+
+	filepath.WalkDir(pubDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		for _, skip := range []string{".git", "node_modules", ".infected"} {
+			if strings.Contains(path, skip) {
+				return nil
+			}
+		}
+		ext := strings.ToLower(filepath.Ext(d.Name()))
+		if !phpExts[ext] {
+			return nil
+		}
+		rel, _ := filepath.Rel(pubDir, path)
+		if isKnownCleanPath(rel) {
+			return nil
+		}
+		matches := scanFileForPatterns(path, patterns)
+		for _, m := range matches {
+			*findings = append(*findings, Finding{
+				Severity: Critical,
+				Check:    "PHP Malware Scan",
+				Detail:   m.desc,
+				File:     rel,
+				Line:     m.line,
+			})
+		}
+		return nil
+	})
+}
+
+// ──────────────────────────────────────────────
+// CHECK: High-risk snippet plugins + DB-stored snippet payloads
+// ──────────────────────────────────────────────
+
+func CheckHighRiskPluginsAndSnippets(pubDir string, findings *[]Finding) {
+	// 1. Installed/active snippet-execution plugins — flagged for review,
+	// not auto-critical, since these are legitimately used too.
+	for _, slug := range HighRiskSnippetPlugins {
+		cmd := exec.Command("wp", "--allow-root", "plugin", "is-installed", slug, "--path="+pubDir)
+		if err := cmd.Run(); err != nil {
+			continue // not installed
+		}
+		out, _ := exec.Command("wp", "--allow-root", "plugin", "status", slug,
+			"--path="+pubDir, "--format=csv", "--quiet").Output()
+		status := "unknown"
+		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(lines) >= 2 {
+			parts := strings.Split(lines[1], ",")
+			if len(parts) >= 2 {
+				status = parts[1]
+			}
+		}
+		*findings = append(*findings, Finding{
+			Severity: Warning,
+			Check:    "Snippet Audit",
+			Detail:   fmt.Sprintf("High-risk snippet/file-manager plugin installed (status: %s) — verify who has access", status),
+			File:     "wp-content/plugins/" + slug,
+		})
+	}
+
+	// 2. Raw snippet payloads sitting in wp_options — this is where the
+	// actual injectable PHP lives regardless of which plugin wrote it.
+	prefixOut, err := exec.Command("wp", "--allow-root", "config", "get", "table_prefix",
+		"--path="+pubDir, "--quiet").Output()
+	if err != nil {
+		return
+	}
+	prefix := strings.TrimSpace(string(prefixOut))
+	if prefix == "" {
+		prefix = "wp_"
+	}
+	optionsTable := prefix + "options"
+
+	inClause := "'" + strings.Join(SnippetOptionKeys, "','") + "'"
+	query := fmt.Sprintf("SELECT option_name FROM %s WHERE option_name IN (%s)", optionsTable, inClause)
+	out, _ := exec.Command("wp", "--allow-root", "db", "query", query,
+		"--path="+pubDir, "--skip-column-names", "--quiet").Output()
+
+	for _, key := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		key = strings.TrimSpace(key)
+		if key == "" {
+			continue
+		}
+		*findings = append(*findings, Finding{
+			Severity: Warning,
+			Check:    "Snippet Audit",
+			Detail: fmt.Sprintf(
+				"Snippet payload stored in wp_options (%s) — inspect with: wp eval 'global $wpdb; echo $wpdb->get_var(\"SELECT option_value FROM %s WHERE option_name = \\\"%s\\\"\");' — remove with: wp db query \"DELETE FROM %s WHERE option_name='%s'\"",
+				key, optionsTable, key, optionsTable, key),
+		})
+	}
 }
 
 // ──────────────────────────────────────────────

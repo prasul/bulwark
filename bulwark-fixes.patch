@@ -1,0 +1,426 @@
+diff --git a/report/html.go b/report/html.go
+index d9a7297..636adc6 100644
+--- a/report/html.go
++++ b/report/html.go
+@@ -13,6 +13,89 @@ import (
+ 
+ 
+ 
++// shortPath returns a display-friendly version of a long relative path:
++// the last two segments, prefixed with an ellipsis marker if truncated.
++// The full path is always preserved in the title attribute by the caller.
++func shortPath(rel string) string {
++	parts := strings.Split(rel, "/")
++	if len(parts) <= 3 {
++		return rel
++	}
++	return ".../" + strings.Join(parts[len(parts)-2:], "/")
++}
++
++// writeFindingsTable renders one site's findings grouped by check type.
++// Groups over groupCollapseThreshold rows are collapsed behind a native
++// <details> disclosure so a single noisy check (e.g. hundreds of files
++// touched by one plugin update) doesn't dominate the page.
++const groupCollapseThreshold = 8
++
++func writeFindingsTable(f *os.File, findings []scanner.Finding) {
++	// Preserve first-seen order of check types.
++	var order []string
++	groups := make(map[string][]scanner.Finding)
++	for _, fnd := range findings {
++		if _, ok := groups[fnd.Check]; !ok {
++			order = append(order, fnd.Check)
++		}
++		groups[fnd.Check] = append(groups[fnd.Check], fnd)
++	}
++
++	for _, checkName := range order {
++		rows := groups[checkName]
++		worstBadge, worstLabel := "badge-info", "info"
++		for _, r := range rows {
++			if r.Severity == scanner.Critical {
++				worstBadge, worstLabel = "badge-critical", "critical"
++				break
++			}
++			if r.Severity == scanner.Warning {
++				worstBadge, worstLabel = "badge-warning", "warning"
++			}
++		}
++
++		fmt.Fprintf(f, `<div class="check-group"><div class="check-group-header">
++<span class="badge %s">%s</span><span class="check-group-name">%s</span><span class="check-group-count">%d finding(s)</span>
++</div><table class="findings-table"><tbody>`, worstBadge, worstLabel, html.EscapeString(checkName), len(rows))
++
++		visible, rest := rows, []scanner.Finding{}
++		if len(rows) > groupCollapseThreshold {
++			visible, rest = rows[:groupCollapseThreshold], rows[groupCollapseThreshold:]
++		}
++		for _, r := range visible {
++			writeFindingRow(f, r)
++		}
++		fmt.Fprint(f, `</tbody></table>`)
++
++		if len(rest) > 0 {
++			fmt.Fprintf(f, `<details class="finding-more"><summary>Show %d more</summary><table class="findings-table"><tbody>`, len(rest))
++			for _, r := range rest {
++				writeFindingRow(f, r)
++			}
++			fmt.Fprint(f, `</tbody></table></details>`)
++		}
++		fmt.Fprint(f, `</div>`)
++	}
++}
++
++func writeFindingRow(f *os.File, finding scanner.Finding) {
++	badge := "badge-info"
++	switch finding.Severity {
++	case scanner.Critical:
++		badge = "badge-critical"
++	case scanner.Warning:
++		badge = "badge-warning"
++	}
++	detail := html.EscapeString(finding.Detail)
++	fileCell := ""
++	if finding.File != "" {
++		fileCell = fmt.Sprintf(`<span class="file-path" title="%s">%s</span>`,
++			html.EscapeString(finding.File), html.EscapeString(shortPath(finding.File)))
++	}
++	fmt.Fprintf(f, `<tr><td style="width:90px"><span class="badge %s">%s</span></td><td class="col-detail">%s<div class="detail-text">%s</div></td></tr>`,
++		badge, finding.Severity, fileCell, detail)
++}
++
+ func GenerateHTML(summary *scanner.ScanSummary, outputPath string) error {
+ 	f, err := os.Create(outputPath)
+ 	if err != nil {
+@@ -61,7 +144,18 @@ body{font-family:'Google Sans','Roboto',Arial,sans-serif;font-size:14px;color:va
+ .badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}
+ .badge-critical{background:var(--red-50);color:var(--red-700)}.badge-warning{background:var(--yellow-50);color:var(--yellow-700)}.badge-info{background:var(--blue-50);color:var(--blue-700)}
+ .clean-msg{padding:18px 24px;color:var(--green-700);font-size:13px;display:flex;align-items:center;gap:8px}
+-.col-detail{font-family:'Roboto Mono','Consolas',monospace;font-size:12px;color:var(--grey-700);word-break:break-all}
++.col-detail{font-family:'Roboto Mono','Consolas',monospace;font-size:12px;color:var(--grey-700);word-break:break-word}
++.check-group{border-top:1px solid var(--grey-200)}
++.check-group-header{display:flex;align-items:center;gap:10px;padding:10px 18px;background:var(--grey-50)}
++.check-group-name{font-size:12px;font-weight:600;color:var(--grey-900)}
++.check-group-count{font-size:11px;color:var(--grey-500);margin-left:auto}
++.file-path{display:block;font-weight:600;color:var(--grey-900);margin-bottom:2px;max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help}
++.detail-text{color:var(--grey-700)}
++.finding-more{border-top:1px solid var(--grey-100)}
++.finding-more>summary{padding:8px 18px;font-size:12px;color:var(--blue-700);cursor:pointer;list-style:none;font-weight:500}
++.finding-more>summary::-webkit-details-marker{display:none}
++.finding-more>summary:before{content:"▸ ";font-size:10px}
++.finding-more[open]>summary:before{content:"▾ "}
+ .page-footer{text-align:center;font-size:12px;color:var(--grey-500);padding:24px 0 0;border-top:1px solid var(--grey-200);margin-top:40px}
+ @media(max-width:900px){.summary-grid{grid-template-columns:repeat(2,1fr)}.page-body,.page-header{padding-left:20px;padding-right:20px}}
+ @media print{.site-card-body{display:block!important}.page-header{position:static}}
+@@ -109,23 +203,7 @@ body{font-family:'Google Sans','Roboto',Arial,sans-serif;font-size:14px;color:va
+ </div></div><div class="site-card-body">`, html.EscapeString(site.Domain), pill, label)
+ 
+ 		if len(site.Findings) > 0 {
+-			fmt.Fprint(f, `<table class="findings-table"><thead><tr><th style="width:90px">Severity</th><th style="width:170px">Check</th><th>Finding</th></tr></thead><tbody>`)
+-			for _, finding := range site.Findings {
+-				badge := "badge-info"
+-				switch finding.Severity {
+-				case scanner.Critical:
+-					badge = "badge-critical"
+-				case scanner.Warning:
+-					badge = "badge-warning"
+-				}
+-				detail := html.EscapeString(finding.Detail)
+-				if finding.File != "" {
+-					detail = fmt.Sprintf("<strong>%s</strong> — %s", html.EscapeString(finding.File), detail)
+-				}
+-				fmt.Fprintf(f, `<tr><td><span class="badge %s">%s</span></td><td>%s</td><td class="col-detail">%s</td></tr>`,
+-					badge, finding.Severity, html.EscapeString(finding.Check), detail)
+-			}
+-			fmt.Fprint(f, `</tbody></table>`)
++			writeFindingsTable(f, site.Findings)
+ 		} else {
+ 			fmt.Fprint(f, `<div class="clean-msg">✔ All security checks passed — no issues detected.</div>`)
+ 		}
+diff --git a/scanner/checks.go b/scanner/checks.go
+index fcf9509..0437003 100644
+--- a/scanner/checks.go
++++ b/scanner/checks.go
+@@ -190,6 +190,17 @@ func CheckRecentlyModified(pubDir string, recentDays int, findings *[]Finding) {
+ 		}
+ 	}
+ 
++	// Collect raw hits first so we can spot plugin-update bursts before
++	// emitting findings — a single `wp plugin update` touches hundreds of
++	// built JS/PHP files with an identical mtime, and reporting each one
++	// individually is noise, not signal.
++	type hit struct {
++		rel      string
++		mtime    time.Time
++		severity Severity
++	}
++	var hits []hit
++
+ 	for _, dir := range suspiciousDirs {
+ 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+ 			if err != nil || d.IsDir() {
+@@ -213,16 +224,67 @@ func CheckRecentlyModified(pubDir string, recentDays int, findings *[]Finding) {
+ 				if strings.Contains(path, "uploads") && ext != ".js" {
+ 					severity = Critical
+ 				}
+-				*findings = append(*findings, Finding{
+-					Severity: severity,
+-					Check:    "Recently Modified",
+-					Detail:   fmt.Sprintf("File modified within %d days (mtime: %s)", recentDays, info.ModTime().Format("2006-01-02 15:04")),
+-					File:     rel,
+-				})
++				hits = append(hits, hit{rel: rel, mtime: info.ModTime(), severity: severity})
+ 			}
+ 			return nil
+ 		})
+ 	}
++
++	// Group by (top-level plugin/theme dir, mtime rounded to the minute).
++	// Bursts of >20 files sharing both collapse into one finding; PHP files
++	// in uploads never collapse since that combination is always Critical.
++	type groupKey struct {
++		root  string
++		stamp string
++	}
++	groups := make(map[groupKey][]hit)
++	for _, h := range hits {
++		if h.severity == Critical {
++			continue // never collapse the high-confidence uploads/PHP case
++		}
++		groups[groupKey{root: burstRoot(h.rel), stamp: h.mtime.Format("2006-01-02 15:04")}] = append(
++			groups[groupKey{root: burstRoot(h.rel), stamp: h.mtime.Format("2006-01-02 15:04")}], h)
++	}
++
++	collapsed := make(map[string]bool)
++	for key, group := range groups {
++		if len(group) > 20 {
++			for _, h := range group {
++				collapsed[h.rel] = true
++			}
++			*findings = append(*findings, Finding{
++				Severity: Info,
++				Check:    "Recently Modified",
++				Detail: fmt.Sprintf(
++					"%d files updated together within %d days (mtime: %s) — consistent with a plugin/theme release, not a targeted change. Verify the version bump if unexpected.",
++					len(group), recentDays, key.stamp),
++				File: key.root + "/",
++			})
++		}
++	}
++
++	for _, h := range hits {
++		if collapsed[h.rel] {
++			continue
++		}
++		*findings = append(*findings, Finding{
++			Severity: h.severity,
++			Check:    "Recently Modified",
++			Detail:   fmt.Sprintf("File modified within %d days (mtime: %s)", recentDays, h.mtime.Format("2006-01-02 15:04")),
++			File:     h.rel,
++		})
++	}
++}
++
++// burstRoot returns the plugin/theme/mu-plugin directory a relative path
++// belongs to (e.g. "wp-content/plugins/google-site-kit"), or the path
++// itself if it doesn't fit that shape. Used to group mtime bursts.
++func burstRoot(rel string) string {
++	parts := strings.Split(filepath.ToSlash(rel), "/")
++	if len(parts) >= 3 && parts[0] == "wp-content" {
++		return strings.Join(parts[:3], "/")
++	}
++	return rel
+ }
+ 
+ // ──────────────────────────────────────────────
+@@ -726,6 +788,108 @@ func CheckPlugins(pubDir string, recentDays int, findings *[]Finding) {
+ 	})
+ }
+ 
++// ──────────────────────────────────────────────
++// CHECK: PHP comment-hidden backdoors (<?php /*- ... )
++// ──────────────────────────────────────────────
++
++func CheckCommentBackdoors(pubDir string, findings *[]Finding) {
++	patterns := compilePatterns(PHPCommentBackdoorPatterns)
++	phpExts := map[string]bool{".php": true, ".php5": true, ".phtml": true}
++
++	filepath.WalkDir(pubDir, func(path string, d fs.DirEntry, err error) error {
++		if err != nil || d.IsDir() {
++			return nil
++		}
++		for _, skip := range []string{".git", "node_modules", ".infected"} {
++			if strings.Contains(path, skip) {
++				return nil
++			}
++		}
++		ext := strings.ToLower(filepath.Ext(d.Name()))
++		if !phpExts[ext] {
++			return nil
++		}
++		rel, _ := filepath.Rel(pubDir, path)
++		if isKnownCleanPath(rel) {
++			return nil
++		}
++		matches := scanFileForPatterns(path, patterns)
++		for _, m := range matches {
++			*findings = append(*findings, Finding{
++				Severity: Critical,
++				Check:    "PHP Malware Scan",
++				Detail:   m.desc,
++				File:     rel,
++				Line:     m.line,
++			})
++		}
++		return nil
++	})
++}
++
++// ──────────────────────────────────────────────
++// CHECK: High-risk snippet plugins + DB-stored snippet payloads
++// ──────────────────────────────────────────────
++
++func CheckHighRiskPluginsAndSnippets(pubDir string, findings *[]Finding) {
++	// 1. Installed/active snippet-execution plugins — flagged for review,
++	// not auto-critical, since these are legitimately used too.
++	for _, slug := range HighRiskSnippetPlugins {
++		cmd := exec.Command("wp", "--allow-root", "plugin", "is-installed", slug, "--path="+pubDir)
++		if err := cmd.Run(); err != nil {
++			continue // not installed
++		}
++		out, _ := exec.Command("wp", "--allow-root", "plugin", "status", slug,
++			"--path="+pubDir, "--format=csv", "--quiet").Output()
++		status := "unknown"
++		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
++		if len(lines) >= 2 {
++			parts := strings.Split(lines[1], ",")
++			if len(parts) >= 2 {
++				status = parts[1]
++			}
++		}
++		*findings = append(*findings, Finding{
++			Severity: Warning,
++			Check:    "Snippet Audit",
++			Detail:   fmt.Sprintf("High-risk snippet/file-manager plugin installed (status: %s) — verify who has access", status),
++			File:     "wp-content/plugins/" + slug,
++		})
++	}
++
++	// 2. Raw snippet payloads sitting in wp_options — this is where the
++	// actual injectable PHP lives regardless of which plugin wrote it.
++	prefixOut, err := exec.Command("wp", "--allow-root", "config", "get", "table_prefix",
++		"--path="+pubDir, "--quiet").Output()
++	if err != nil {
++		return
++	}
++	prefix := strings.TrimSpace(string(prefixOut))
++	if prefix == "" {
++		prefix = "wp_"
++	}
++	optionsTable := prefix + "options"
++
++	inClause := "'" + strings.Join(SnippetOptionKeys, "','") + "'"
++	query := fmt.Sprintf("SELECT option_name FROM %s WHERE option_name IN (%s)", optionsTable, inClause)
++	out, _ := exec.Command("wp", "--allow-root", "db", "query", query,
++		"--path="+pubDir, "--skip-column-names", "--quiet").Output()
++
++	for _, key := range strings.Split(strings.TrimSpace(string(out)), "\n") {
++		key = strings.TrimSpace(key)
++		if key == "" {
++			continue
++		}
++		*findings = append(*findings, Finding{
++			Severity: Warning,
++			Check:    "Snippet Audit",
++			Detail: fmt.Sprintf(
++				"Snippet payload stored in wp_options (%s) — inspect with: wp eval 'global $wpdb; echo $wpdb->get_var(\"SELECT option_value FROM %s WHERE option_name = \\\"%s\\\"\");' — remove with: wp db query \"DELETE FROM %s WHERE option_name='%s'\"",
++				key, optionsTable, key, optionsTable, key),
++		})
++	}
++}
++
+ // ──────────────────────────────────────────────
+ // HELPER: Scan a file against compiled patterns
+ // ──────────────────────────────────────────────
+diff --git a/scanner/patterns.go b/scanner/patterns.go
+index 12924c7..b64d922 100644
+--- a/scanner/patterns.go
++++ b/scanner/patterns.go
+@@ -77,6 +77,32 @@ var PHPMalwarePatterns = []PatternDef{
+ 	// === Spam/mailer indicators ===
+ 	{Pattern: `mail\s*\(.*\$_(GET|POST|REQUEST)`, Desc: "mail() with user input"},
+ 	{Pattern: `@sendmail`, Desc: "@sendmail directive"},
++
++	// === Ported from hackchk.sh backdoor scan (2025-2026 campaigns) ===
++	{Pattern: `eval\s*\(\s*\$_REQUEST`, Desc: "eval($_REQUEST)"},
++	{Pattern: `(?i)IndoXploit`, Desc: "IndoXploit TMP backdoor"},
++	{Pattern: `(?i)AnonymoX9jaTeam`, Desc: "AnonymoX9jaTeam signature"},
++	{Pattern: `(?i)blackpanther1337`, Desc: "blackpanther1337 signature"},
++	{Pattern: `(?i)shellx\.org`, Desc: "shellx.org callback reference"},
++	{Pattern: `(?i)womndo\.com`, Desc: "womndo.com callback reference"},
++	{Pattern: `(?i)xXsUIssAZ|ALgR_Dz|An0n_3xPloiTeR`, Desc: "known defacement signature"},
++	{Pattern: `str_split\s*\(\s*rawurldecode\s*\(\s*str_rot13`, Desc: "str_split(rawurldecode(str_rot13(…)))"},
++	{Pattern: `base64_decode\s*\(\s*rawurldecode\s*\(\s*\(?urlencode\s*\(\s*urldecode\s*\(\s*\$_REQUEST`, Desc: "layered decode of $_REQUEST"},
++	{Pattern: `\$[a-zA-Z0-9]{5}\s*=\s*curl_init`, Desc: "randomized-var curl_init (dropper pattern)"},
++	{Pattern: `create_function\s*\(\s*["']["']\s*,\s*rawurldecode`, Desc: "create_function with rawurldecode payload"},
++	{Pattern: `move_uploaded_file\s*\(\s*\$_`, Desc: "move_uploaded_file() with superglobal input"},
++	{Pattern: `if\s*\(\s*isset\s*\(\s*\$_SERVER\[.HTTP_`, Desc: "conditional gate on custom HTTP header"},
++	{Pattern: `\\x63\\x72\\x65\\x61\\x74\\x65\\x5f\\x75\\x6e\\x63\\x74\\x69\\x6f\\x6e`, Desc: "hex-encoded 'create_function'"},
++	{Pattern: `if\s*\(\s*\$_GET\[.pw.\]\s*==\s*\$password\s*\)`, Desc: "hardcoded password gate on $_GET['pw']"},
++	{Pattern: `error_reporting\s*\(\s*0\s*\)\s*;\s*ini_set\s*\(\s*["']display_errors["']\s*,\s*0\s*\)\s*;\s*if\s*\(\s*!\s*defined`, Desc: "error-suppression preamble (webshell boilerplate)"},
++	{Pattern: `get_magic_quotes_gpc\s*\(\s*\)\s*\)\s*\{\s*foreach\s*\(\s*\$_POST`, Desc: "legacy magic_quotes stripslashes wrapper (webshell boilerplate)"},
++}
++
++// PHPCommentBackdoorPatterns match payloads hidden in PHP comment openers —
++// grep -F "<?php /*-" in the original bash scanner. Kept separate since
++// it's a literal substring match, not a regex pattern.
++var PHPCommentBackdoorPatterns = []PatternDef{
++	{Pattern: `<\?php\s*/\*-`, Desc: "payload hidden after fake comment opener <?php /*-"},
+ }
+ 
+ // FunctionsPHPPatterns are specifically for detecting injections in
+@@ -155,6 +181,27 @@ var KnownCleanPHPPaths = []string{
+ 	"gotmls",
+ }
+ 
++// HighRiskSnippetPlugins are plugins that let an attacker (or a compromised
++// admin account) execute arbitrary PHP directly from the DB or wp-admin —
++// no file-write access needed. Legitimate uses exist, so these are flagged
++// for review, not treated as malware on their own.
++var HighRiskSnippetPlugins = []string{
++	"wpcode",
++	"insert-headers-and-footers",
++	"wp-file-manager",
++	"code-snippets",
++	"header-footer",
++}
++
++// SnippetOptionKeys are wp_options rows where the above plugins persist
++// raw PHP/HTML payloads. A hit here means there's injectable code sitting
++// in the DB even if no plugin file on disk looks wrong.
++var SnippetOptionKeys = []string{
++	"wpcode_snippets",
++	"ihaf_settings",
++	"code_snippets_db",
++}
++
+ // PatternDef is a regex pattern with a human-readable description
+ type PatternDef struct {
+ 	Pattern string
+diff --git a/scanner/scanner.go b/scanner/scanner.go
+index 935b543..bd0ffaf 100644
+--- a/scanner/scanner.go
++++ b/scanner/scanner.go
+@@ -111,6 +111,12 @@ func (s *Scanner) scanSite(domain, siteDir, pubDir string) SiteResult {
+ 		{"Database Scan", func() {
+ 			CheckDatabase(pubDir, &findings)
+ 		}},
++		{"PHP Malware Scan", func() {
++			CheckCommentBackdoors(pubDir, &findings)
++		}},
++		{"Snippet Audit", func() {
++			CheckHighRiskPluginsAndSnippets(pubDir, &findings)
++		}},
+ 	}
+ 
+ 	for _, c := range checks {

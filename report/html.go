@@ -12,6 +12,89 @@ import (
 
 
 
+// shortPath returns a display-friendly version of a long relative path:
+// the last two segments, prefixed with an ellipsis marker if truncated.
+// The full path is always preserved in the title attribute by the caller.
+func shortPath(rel string) string {
+	parts := strings.Split(rel, "/")
+	if len(parts) <= 3 {
+		return rel
+	}
+	return ".../" + strings.Join(parts[len(parts)-2:], "/")
+}
+
+// writeFindingsTable renders one site's findings grouped by check type.
+// Groups over groupCollapseThreshold rows are collapsed behind a native
+// <details> disclosure so a single noisy check (e.g. hundreds of files
+// touched by one plugin update) doesn't dominate the page.
+const groupCollapseThreshold = 8
+
+func writeFindingsTable(f *os.File, findings []scanner.Finding) {
+	// Preserve first-seen order of check types.
+	var order []string
+	groups := make(map[string][]scanner.Finding)
+	for _, fnd := range findings {
+		if _, ok := groups[fnd.Check]; !ok {
+			order = append(order, fnd.Check)
+		}
+		groups[fnd.Check] = append(groups[fnd.Check], fnd)
+	}
+
+	for _, checkName := range order {
+		rows := groups[checkName]
+		worstBadge, worstLabel := "badge-info", "info"
+		for _, r := range rows {
+			if r.Severity == scanner.Critical {
+				worstBadge, worstLabel = "badge-critical", "critical"
+				break
+			}
+			if r.Severity == scanner.Warning {
+				worstBadge, worstLabel = "badge-warning", "warning"
+			}
+		}
+
+		fmt.Fprintf(f, `<div class="check-group"><div class="check-group-header">
+<span class="badge %s">%s</span><span class="check-group-name">%s</span><span class="check-group-count">%d finding(s)</span>
+</div><table class="findings-table"><tbody>`, worstBadge, worstLabel, html.EscapeString(checkName), len(rows))
+
+		visible, rest := rows, []scanner.Finding{}
+		if len(rows) > groupCollapseThreshold {
+			visible, rest = rows[:groupCollapseThreshold], rows[groupCollapseThreshold:]
+		}
+		for _, r := range visible {
+			writeFindingRow(f, r)
+		}
+		fmt.Fprint(f, `</tbody></table>`)
+
+		if len(rest) > 0 {
+			fmt.Fprintf(f, `<details class="finding-more"><summary>Show %d more</summary><table class="findings-table"><tbody>`, len(rest))
+			for _, r := range rest {
+				writeFindingRow(f, r)
+			}
+			fmt.Fprint(f, `</tbody></table></details>`)
+		}
+		fmt.Fprint(f, `</div>`)
+	}
+}
+
+func writeFindingRow(f *os.File, finding scanner.Finding) {
+	badge := "badge-info"
+	switch finding.Severity {
+	case scanner.Critical:
+		badge = "badge-critical"
+	case scanner.Warning:
+		badge = "badge-warning"
+	}
+	detail := html.EscapeString(finding.Detail)
+	fileCell := ""
+	if finding.File != "" {
+		fileCell = fmt.Sprintf(`<span class="file-path" title="%s">%s</span>`,
+			html.EscapeString(finding.File), html.EscapeString(shortPath(finding.File)))
+	}
+	fmt.Fprintf(f, `<tr><td style="width:90px"><span class="badge %s">%s</span></td><td class="col-detail">%s<div class="detail-text">%s</div></td></tr>`,
+		badge, finding.Severity, fileCell, detail)
+}
+
 func GenerateHTML(summary *scanner.ScanSummary, outputPath string) error {
 	f, err := os.Create(outputPath)
 	if err != nil {
@@ -60,7 +143,18 @@ body{font-family:'Google Sans','Roboto',Arial,sans-serif;font-size:14px;color:va
 .badge{display:inline-block;font-size:10px;font-weight:700;padding:2px 8px;border-radius:10px;letter-spacing:.05em;text-transform:uppercase;white-space:nowrap}
 .badge-critical{background:var(--red-50);color:var(--red-700)}.badge-warning{background:var(--yellow-50);color:var(--yellow-700)}.badge-info{background:var(--blue-50);color:var(--blue-700)}
 .clean-msg{padding:18px 24px;color:var(--green-700);font-size:13px;display:flex;align-items:center;gap:8px}
-.col-detail{font-family:'Roboto Mono','Consolas',monospace;font-size:12px;color:var(--grey-700);word-break:break-all}
+.col-detail{font-family:'Roboto Mono','Consolas',monospace;font-size:12px;color:var(--grey-700);word-break:break-word}
+.check-group{border-top:1px solid var(--grey-200)}
+.check-group-header{display:flex;align-items:center;gap:10px;padding:10px 18px;background:var(--grey-50)}
+.check-group-name{font-size:12px;font-weight:600;color:var(--grey-900)}
+.check-group-count{font-size:11px;color:var(--grey-500);margin-left:auto}
+.file-path{display:block;font-weight:600;color:var(--grey-900);margin-bottom:2px;max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help}
+.detail-text{color:var(--grey-700)}
+.finding-more{border-top:1px solid var(--grey-100)}
+.finding-more>summary{padding:8px 18px;font-size:12px;color:var(--blue-700);cursor:pointer;list-style:none;font-weight:500}
+.finding-more>summary::-webkit-details-marker{display:none}
+.finding-more>summary:before{content:"▸ ";font-size:10px}
+.finding-more[open]>summary:before{content:"▾ "}
 .page-footer{text-align:center;font-size:12px;color:var(--grey-500);padding:24px 0 0;border-top:1px solid var(--grey-200);margin-top:40px}
 @media(max-width:900px){.summary-grid{grid-template-columns:repeat(2,1fr)}.page-body,.page-header{padding-left:20px;padding-right:20px}}
 @media print{.site-card-body{display:block!important}.page-header{position:static}}
@@ -108,23 +202,7 @@ body{font-family:'Google Sans','Roboto',Arial,sans-serif;font-size:14px;color:va
 </div></div><div class="site-card-body">`, html.EscapeString(site.Domain), pill, label)
 
 		if len(site.Findings) > 0 {
-			fmt.Fprint(f, `<table class="findings-table"><thead><tr><th style="width:90px">Severity</th><th style="width:170px">Check</th><th>Finding</th></tr></thead><tbody>`)
-			for _, finding := range site.Findings {
-				badge := "badge-info"
-				switch finding.Severity {
-				case scanner.Critical:
-					badge = "badge-critical"
-				case scanner.Warning:
-					badge = "badge-warning"
-				}
-				detail := html.EscapeString(finding.Detail)
-				if finding.File != "" {
-					detail = fmt.Sprintf("<strong>%s</strong> — %s", html.EscapeString(finding.File), detail)
-				}
-				fmt.Fprintf(f, `<tr><td><span class="badge %s">%s</span></td><td>%s</td><td class="col-detail">%s</td></tr>`,
-					badge, finding.Severity, html.EscapeString(finding.Check), detail)
-			}
-			fmt.Fprint(f, `</tbody></table>`)
+			writeFindingsTable(f, site.Findings)
 		} else {
 			fmt.Fprint(f, `<div class="clean-msg">✔ All security checks passed — no issues detected.</div>`)
 		}

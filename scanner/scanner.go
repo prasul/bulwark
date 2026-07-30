@@ -111,6 +111,12 @@ func (s *Scanner) scanSite(domain, siteDir, pubDir string) SiteResult {
 		{"Database Scan", func() {
 			CheckDatabase(pubDir, &findings)
 		}},
+		{"PHP Malware Scan", func() {
+			CheckCommentBackdoors(pubDir, &findings)
+		}},
+		{"Snippet Audit", func() {
+			CheckHighRiskPluginsAndSnippets(pubDir, &findings)
+		}},
 	}
 
 	for _, c := range checks {

@@ -77,6 +77,32 @@ var PHPMalwarePatterns = []PatternDef{
 	// === Spam/mailer indicators ===
 	{Pattern: `mail\s*\(.*\$_(GET|POST|REQUEST)`, Desc: "mail() with user input"},
 	{Pattern: `@sendmail`, Desc: "@sendmail directive"},
+
+	// === Ported from hackchk.sh backdoor scan (2025-2026 campaigns) ===
+	{Pattern: `eval\s*\(\s*\$_REQUEST`, Desc: "eval($_REQUEST)"},
+	{Pattern: `(?i)IndoXploit`, Desc: "IndoXploit TMP backdoor"},
+	{Pattern: `(?i)AnonymoX9jaTeam`, Desc: "AnonymoX9jaTeam signature"},
+	{Pattern: `(?i)blackpanther1337`, Desc: "blackpanther1337 signature"},
+	{Pattern: `(?i)shellx\.org`, Desc: "shellx.org callback reference"},
+	{Pattern: `(?i)womndo\.com`, Desc: "womndo.com callback reference"},
+	{Pattern: `(?i)xXsUIssAZ|ALgR_Dz|An0n_3xPloiTeR`, Desc: "known defacement signature"},
+	{Pattern: `str_split\s*\(\s*rawurldecode\s*\(\s*str_rot13`, Desc: "str_split(rawurldecode(str_rot13(…)))"},
+	{Pattern: `base64_decode\s*\(\s*rawurldecode\s*\(\s*\(?urlencode\s*\(\s*urldecode\s*\(\s*\$_REQUEST`, Desc: "layered decode of $_REQUEST"},
+	{Pattern: `\$[a-zA-Z0-9]{5}\s*=\s*curl_init`, Desc: "randomized-var curl_init (dropper pattern)"},
+	{Pattern: `create_function\s*\(\s*["']["']\s*,\s*rawurldecode`, Desc: "create_function with rawurldecode payload"},
+	{Pattern: `move_uploaded_file\s*\(\s*\$_`, Desc: "move_uploaded_file() with superglobal input"},
+	{Pattern: `if\s*\(\s*isset\s*\(\s*\$_SERVER\[.HTTP_`, Desc: "conditional gate on custom HTTP header"},
+	{Pattern: `\\x63\\x72\\x65\\x61\\x74\\x65\\x5f\\x75\\x6e\\x63\\x74\\x69\\x6f\\x6e`, Desc: "hex-encoded 'create_function'"},
+	{Pattern: `if\s*\(\s*\$_GET\[.pw.\]\s*==\s*\$password\s*\)`, Desc: "hardcoded password gate on $_GET['pw']"},
+	{Pattern: `error_reporting\s*\(\s*0\s*\)\s*;\s*ini_set\s*\(\s*["']display_errors["']\s*,\s*0\s*\)\s*;\s*if\s*\(\s*!\s*defined`, Desc: "error-suppression preamble (webshell boilerplate)"},
+	{Pattern: `get_magic_quotes_gpc\s*\(\s*\)\s*\)\s*\{\s*foreach\s*\(\s*\$_POST`, Desc: "legacy magic_quotes stripslashes wrapper (webshell boilerplate)"},
+}
+
+// PHPCommentBackdoorPatterns match payloads hidden in PHP comment openers —
+// grep -F "<?php /*-" in the original bash scanner. Kept separate since
+// it's a literal substring match, not a regex pattern.
+var PHPCommentBackdoorPatterns = []PatternDef{
+	{Pattern: `<\?php\s*/\*-`, Desc: "payload hidden after fake comment opener <?php /*-"},
 }
 
 // FunctionsPHPPatterns are specifically for detecting injections in
@@ -153,6 +179,27 @@ var KnownCleanPHPPaths = []string{
 	"all-in-one-wp-security",
 	"anti-malware",
 	"gotmls",
+}
+
+// HighRiskSnippetPlugins are plugins that let an attacker (or a compromised
+// admin account) execute arbitrary PHP directly from the DB or wp-admin —
+// no file-write access needed. Legitimate uses exist, so these are flagged
+// for review, not treated as malware on their own.
+var HighRiskSnippetPlugins = []string{
+	"wpcode",
+	"insert-headers-and-footers",
+	"wp-file-manager",
+	"code-snippets",
+	"header-footer",
+}
+
+// SnippetOptionKeys are wp_options rows where the above plugins persist
+// raw PHP/HTML payloads. A hit here means there's injectable code sitting
+// in the DB even if no plugin file on disk looks wrong.
+var SnippetOptionKeys = []string{
+	"wpcode_snippets",
+	"ihaf_settings",
+	"code_snippets_db",
 }
 
 // PatternDef is a regex pattern with a human-readable description
