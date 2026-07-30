@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"html"
 	"os"
-
+	"strings"
 	"time"
 
 	"github.com/prasul/wpscan/scanner"
