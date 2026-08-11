@@ -1,0 +1,25 @@
+{
+  "_comment": "Copy this file to custom_patterns.json (or point -custom-patterns at it) to add your own signatures. Missing file = no custom patterns, nothing breaks. Each entry is merged into the matching built-in list at the start of every scan run.",
+
+  "_fields": {
+    "check": "Which built-in list this joins: php (default), functions, js, or db.",
+    "pattern": "A Go regexp (RE2 syntax). Same engine as the built-in patterns.",
+    "desc": "Human-readable label shown in findings.",
+    "weight": "low | medium | high — see scanner/confidence.go. Use 'high' only for something you're confident is never legitimate on its own; 'low' for anything that could plausibly appear in normal code, so it only escalates to Critical when corroborated by another signal."
+  },
+
+  "patterns": [
+    {
+      "check": "php",
+      "pattern": "(?i)my_known_bad_webshell_string",
+      "desc": "example: a webshell string seen on a compromised site of ours",
+      "weight": "high"
+    },
+    {
+      "check": "js",
+      "pattern": "(?i)some-sketchy-cdn\\.example\\.com",
+      "desc": "example: a malvertising domain seen in a past incident",
+      "weight": "medium"
+    }
+  ]
+}

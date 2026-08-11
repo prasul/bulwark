@@ -1,0 +1,29 @@
+{
+  "_comment": "Copy this file to vulnerabilities.json (or point -vuln-config at it) to hand-add known-vulnerable plugin/theme/core version ranges. This file is never touched by `wpscan vulns update` — that command only writes vulnerabilities.wordfence.json. Keep your own entries here so the two never clash.",
+
+  "_fields": {
+    "type": "plugin | theme | core",
+    "slug": "the wp-cli slug — same value `wp plugin list --fields=name` / `wp theme list --fields=name` prints, e.g. 'akismet'. For core use slug 'wordpress'.",
+    "from_version": "'*' (or omit) for no lower bound, otherwise a dotted version like '1.0.0'.",
+    "to_version": "the last vulnerable version, e.g. '1.2.3'.",
+    "to_inclusive": "true if to_version itself is still vulnerable (the common case for '<= 1.2.3' advisories).",
+    "severity": "critical | high | warning | medium | info | low",
+    "cve": "optional CVE ID",
+    "note": "optional free-text — why you added this, what to do about it"
+  },
+
+  "vulnerabilities": [
+    {
+      "type": "plugin",
+      "slug": "example-plugin",
+      "name": "Example Plugin",
+      "title": "Example Plugin <= 1.2.3 - Authenticated Arbitrary File Upload",
+      "from_version": "*",
+      "to_version": "1.2.3",
+      "to_inclusive": true,
+      "severity": "critical",
+      "cve": "CVE-2026-00000",
+      "note": "No official patch as of writing — deactivate or remove until a fixed version ships."
+    }
+  ]
+}

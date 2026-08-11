@@ -78,6 +78,41 @@ func writeFindingsTable(f *os.File, findings []scanner.Finding) {
 	}
 }
 
+// splitBySeverity divides findings into Critical and everything else,
+// preserving relative order within each group.
+func splitBySeverity(findings []scanner.Finding) (critical, context []scanner.Finding) {
+	for _, fnd := range findings {
+		if fnd.Severity == scanner.Critical {
+			critical = append(critical, fnd)
+		} else {
+			context = append(context, fnd)
+		}
+	}
+	return critical, context
+}
+
+// writeTieredFindings renders Critical findings up front, same as before,
+// and everything else — Warning/Info — in a collapsed "additional context"
+// block underneath. Nothing is dropped; lower-confidence signals are just
+// deprioritized instead of competing with Critical for attention, which is
+// what matters most when this report is being read during an active hack
+// check: see what's definitely wrong first, then optionally dig into what
+// almost matched (a near-miss pattern, a burst of files a plugin update
+// touched, etc.) for extra context.
+func writeTieredFindings(f *os.File, findings []scanner.Finding) {
+	critical, context := splitBySeverity(findings)
+
+	if len(critical) > 0 {
+		writeFindingsTable(f, critical)
+	}
+
+	if len(context) > 0 {
+		fmt.Fprintf(f, `<details class="context-section"><summary>%d lower-confidence finding(s) — additional context</summary>`, len(context))
+		writeFindingsTable(f, context)
+		fmt.Fprint(f, `</details>`)
+	}
+}
+
 func writeFindingRow(f *os.File, finding scanner.Finding) {
 	badge := "badge-info"
 	switch finding.Severity {
@@ -156,6 +191,12 @@ body{font-family:'Google Sans','Roboto',Arial,sans-serif;font-size:14px;color:va
 .finding-more>summary::-webkit-details-marker{display:none}
 .finding-more>summary:before{content:"▸ ";font-size:10px}
 .finding-more[open]>summary:before{content:"▾ "}
+.context-section{border-top:2px solid var(--grey-200);background:var(--grey-50)}
+.context-section>summary{padding:12px 18px;font-size:12px;color:var(--grey-500);cursor:pointer;list-style:none;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.context-section>summary::-webkit-details-marker{display:none}
+.context-section>summary:before{content:"▸ ";font-size:10px}
+.context-section[open]>summary:before{content:"▾ "}
+.context-section .check-group-header{background:var(--grey-100)}
 .page-footer{text-align:center;font-size:12px;color:var(--grey-500);padding:24px 0 0;border-top:1px solid var(--grey-200);margin-top:40px}
 @media(max-width:900px){.summary-grid{grid-template-columns:repeat(2,1fr)}.page-body,.page-header{padding-left:20px;padding-right:20px}}
 @media print{.site-card-body{display:block!important}.page-header{position:static}}
@@ -190,7 +231,7 @@ body{font-family:'Google Sans','Roboto',Arial,sans-serif;font-size:14px;color:va
 	// ── Host-level findings (server crontab, etc — not scoped to one site)
 	if len(summary.HostFindings) > 0 {
 		fmt.Fprint(f, `<div class="section-title">Host-Level Findings</div><div class="site-card"><div class="site-card-body" style="display:block">`)
-		writeFindingsTable(f, summary.HostFindings)
+		writeTieredFindings(f, summary.HostFindings)
 		fmt.Fprint(f, `</div></div>`)
 	}
 
@@ -210,7 +251,7 @@ body{font-family:'Google Sans','Roboto',Arial,sans-serif;font-size:14px;color:va
 </div></div><div class="site-card-body">`, html.EscapeString(site.Domain), pill, label)
 
 		if len(site.Findings) > 0 {
-			writeFindingsTable(f, site.Findings)
+			writeTieredFindings(f, site.Findings)
 		} else {
 			fmt.Fprint(f, `<div class="clean-msg">✔ All security checks passed — no issues detected.</div>`)
 		}

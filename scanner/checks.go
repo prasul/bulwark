@@ -21,14 +21,15 @@ func compilePatterns(defs []PatternDef) []*compiledPattern {
 		if err != nil {
 			continue
 		}
-		out = append(out, &compiledPattern{re: re, desc: d.Desc})
+		out = append(out, &compiledPattern{re: re, desc: d.Desc, weight: d.Weight})
 	}
 	return out
 }
 
 type compiledPattern struct {
-	re   *regexp.Regexp
-	desc string
+	re     *regexp.Regexp
+	desc   string
+	weight int
 }
 
 // isKnownCleanPath returns true if the file path is in a known-safe location
@@ -167,7 +168,19 @@ func CheckRecentlyModified(pubDir string, recentDays int, findings *[]Finding) {
 		filepath.Join(pubDir, "wp-content", "uploads"),
 	}
 
-	// Also check core files (wp-*.php in root)
+	// Collect raw hits first so we can spot update bursts before emitting
+	// findings — a single `wp plugin update` (or a core auto-update)
+	// touches a batch of files with an identical mtime, and reporting each
+	// one individually is noise, not signal. Root-level core files
+	// (wp-login.php etc.) join the same pipeline as plugin/theme files so a
+	// core update collapses the same way.
+	type hit struct {
+		rel      string
+		mtime    time.Time
+		severity Severity
+	}
+	var hits []hit
+
 	entries, _ := os.ReadDir(pubDir)
 	for _, e := range entries {
 		if e.IsDir() {
@@ -182,25 +195,9 @@ func CheckRecentlyModified(pubDir string, recentDays int, findings *[]Finding) {
 			continue
 		}
 		if info.ModTime().After(cutoff) {
-			*findings = append(*findings, Finding{
-				Severity: Warning,
-				Check:    "Recently Modified",
-				Detail:   fmt.Sprintf("Core file modified within %d days (mtime: %s)", recentDays, info.ModTime().Format("2006-01-02 15:04")),
-				File:     name,
-			})
+			hits = append(hits, hit{rel: name, mtime: info.ModTime(), severity: Warning})
 		}
 	}
-
-	// Collect raw hits first so we can spot plugin-update bursts before
-	// emitting findings — a single `wp plugin update` touches hundreds of
-	// built JS/PHP files with an identical mtime, and reporting each one
-	// individually is noise, not signal.
-	type hit struct {
-		rel      string
-		mtime    time.Time
-		severity Severity
-	}
-	var hits []hit
 
 	for _, dir := range suspiciousDirs {
 		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
@@ -231,9 +228,15 @@ func CheckRecentlyModified(pubDir string, recentDays int, findings *[]Finding) {
 		})
 	}
 
-	// Group by (top-level plugin/theme dir, mtime rounded to the minute).
-	// Bursts of >20 files sharing both collapse into one finding; PHP files
-	// in uploads never collapse since that combination is always Critical.
+	// Group by (plugin/theme/mu-plugin/core root, mtime rounded to the
+	// minute). Real updates — wp-cli, WP core auto-update, a human running
+	// a deploy — touch a batch of files that all land with the same
+	// to-the-minute mtime; a targeted backdoor drop essentially never does.
+	// 3+ files sharing both collapse into a single "X was updated" line;
+	// PHP files in uploads never collapse since that combination is always
+	// Critical regardless of how it got there.
+	const burstThreshold = 3
+
 	type groupKey struct {
 		root  string
 		stamp string
@@ -243,25 +246,24 @@ func CheckRecentlyModified(pubDir string, recentDays int, findings *[]Finding) {
 		if h.severity == Critical {
 			continue // never collapse the high-confidence uploads/PHP case
 		}
-		groups[groupKey{root: burstRoot(h.rel), stamp: h.mtime.Format("2006-01-02 15:04")}] = append(
-			groups[groupKey{root: burstRoot(h.rel), stamp: h.mtime.Format("2006-01-02 15:04")}], h)
+		key := groupKey{root: burstRoot(h.rel), stamp: h.mtime.Format("2006-01-02 15:04")}
+		groups[key] = append(groups[key], h)
 	}
 
 	collapsed := make(map[string]bool)
 	for key, group := range groups {
-		if len(group) > 20 {
-			for _, h := range group {
-				collapsed[h.rel] = true
-			}
-			*findings = append(*findings, Finding{
-				Severity: Info,
-				Check:    "Recently Modified",
-				Detail: fmt.Sprintf(
-					"%d files updated together within %d days (mtime: %s) — consistent with a plugin/theme release, not a targeted change. Verify the version bump if unexpected.",
-					len(group), recentDays, key.stamp),
-				File: key.root + "/",
-			})
+		if len(group) < burstThreshold {
+			continue
 		}
+		for _, h := range group {
+			collapsed[h.rel] = true
+		}
+		*findings = append(*findings, Finding{
+			Severity: Info,
+			Check:    "Recently Modified",
+			Detail:   fmt.Sprintf("%s (%d files, mtime %s)", updateLabel(key.root), len(group), key.stamp),
+			File:     key.root,
+		})
 	}
 
 	for _, h := range hits {
@@ -278,14 +280,44 @@ func CheckRecentlyModified(pubDir string, recentDays int, findings *[]Finding) {
 }
 
 // burstRoot returns the plugin/theme/mu-plugin directory a relative path
-// belongs to (e.g. "wp-content/plugins/google-site-kit"), or the path
-// itself if it doesn't fit that shape. Used to group mtime bursts.
+// belongs to (e.g. "wp-content/plugins/google-site-kit"), a synthetic
+// "wordpress-core" root for root-level core files (wp-login.php, etc.) so
+// they can burst-collapse together too, or the path itself as a fallback.
+// Used to group mtime bursts.
 func burstRoot(rel string) string {
 	parts := strings.Split(filepath.ToSlash(rel), "/")
 	if len(parts) >= 3 && parts[0] == "wp-content" {
 		return strings.Join(parts[:3], "/")
 	}
+	if len(parts) == 1 {
+		return "wordpress-core"
+	}
 	return rel
+}
+
+// updateLabel turns a burstRoot() value into a short, human sentence for
+// the collapsed "Recently Modified" finding — e.g. "google-site-kit plugin
+// was updated" instead of a raw path and a file count.
+func updateLabel(root string) string {
+	if root == "wordpress-core" {
+		return "WordPress core files were updated"
+	}
+
+	parts := strings.Split(root, "/")
+	if len(parts) == 3 && parts[0] == "wp-content" {
+		kind := map[string]string{
+			"plugins":    "plugin",
+			"themes":     "theme",
+			"mu-plugins": "mu-plugin",
+			"uploads":    "files in uploads",
+		}[parts[1]]
+		if kind == "" {
+			return root + " was updated"
+		}
+		return fmt.Sprintf("%s %s was updated", parts[2], kind)
+	}
+
+	return root + " was updated"
 }
 
 // ──────────────────────────────────────────────
@@ -325,6 +357,7 @@ func CheckPHPMalware(pubDir string, findings *[]Finding) {
 		matches := scanFileForPatterns(path, patterns)
 		if len(matches) > 0 {
 			seen[rel] = true
+			score, severity := scoreMatches(matches)
 			ctx := make([]string, 0, 3)
 			for i, m := range matches {
 				if i >= 3 {
@@ -333,11 +366,13 @@ func CheckPHPMalware(pubDir string, findings *[]Finding) {
 				ctx = append(ctx, fmt.Sprintf("L%d: %s", m.line, m.desc))
 			}
 			*findings = append(*findings, Finding{
-				Severity: Critical,
-				Check:    "PHP Malware Scan",
-				Detail:   strings.Join(ctx, " | "),
-				File:     rel,
-				Line:     matches[0].line,
+				Severity:   severity,
+				Check:      "PHP Malware Scan",
+				Detail:     fmt.Sprintf("%s (confidence %d, %d signal(s))", strings.Join(ctx, " | "), score, signalCount(matches)),
+				File:       rel,
+				Line:       matches[0].line,
+				Confidence: score,
+				Signals:    signalCount(matches),
 			})
 		}
 		return nil
@@ -366,15 +401,26 @@ func CheckFunctionsInjection(pubDir string, findings *[]Finding) {
 
 		rel, _ := filepath.Rel(pubDir, path)
 		matches := scanFileForPatterns(path, patterns)
-		for _, m := range matches {
-			*findings = append(*findings, Finding{
-				Severity: Critical,
-				Check:    "Theme Hook Injection",
-				Detail:   fmt.Sprintf("%s — %s", m.desc, m.context),
-				File:     rel,
-				Line:     m.line,
-			})
+		if len(matches) == 0 {
+			return nil
 		}
+		score, severity := scoreMatches(matches)
+		ctx := make([]string, 0, 3)
+		for i, m := range matches {
+			if i >= 3 {
+				break
+			}
+			ctx = append(ctx, fmt.Sprintf("L%d: %s — %s", m.line, m.desc, m.context))
+		}
+		*findings = append(*findings, Finding{
+			Severity:   severity,
+			Check:      "Theme Hook Injection",
+			Detail:     fmt.Sprintf("%s (confidence %d, %d signal(s))", strings.Join(ctx, " | "), score, signalCount(matches)),
+			File:       rel,
+			Line:       matches[0].line,
+			Confidence: score,
+			Signals:    signalCount(matches),
+		})
 		return nil
 	})
 }
@@ -408,15 +454,7 @@ func CheckJSInjection(pubDir string, findings *[]Finding) {
 
 		rel, _ := filepath.Rel(pubDir, path)
 		matches := scanFileForPatterns(path, patterns)
-		for _, m := range matches {
-			*findings = append(*findings, Finding{
-				Severity: Critical,
-				Check:    "JS Injection",
-				Detail:   fmt.Sprintf("%s — %s", m.desc, m.context),
-				File:     rel,
-				Line:     m.line,
-			})
-		}
+		addJSFinding(findings, rel, matches)
 		return nil
 	})
 
@@ -428,16 +466,35 @@ func CheckJSInjection(pubDir string, findings *[]Finding) {
 		}
 		path := filepath.Join(pubDir, e.Name())
 		matches := scanFileForPatterns(path, patterns)
-		for _, m := range matches {
-			*findings = append(*findings, Finding{
-				Severity: Critical,
-				Check:    "JS Injection",
-				Detail:   fmt.Sprintf("%s — %s", m.desc, m.context),
-				File:     e.Name(),
-				Line:     m.line,
-			})
-		}
+		addJSFinding(findings, e.Name(), matches)
 	}
+}
+
+// addJSFinding aggregates a file's pattern matches into one confidence-scored
+// finding instead of emitting one Critical finding per matched line — a
+// script that only trips one Low-weight signal (e.g. an unrecognized CDN
+// domain) shouldn't carry the same severity as one tripping several.
+func addJSFinding(findings *[]Finding, rel string, matches []matchResult) {
+	if len(matches) == 0 {
+		return
+	}
+	score, severity := scoreMatches(matches)
+	ctx := make([]string, 0, 3)
+	for i, m := range matches {
+		if i >= 3 {
+			break
+		}
+		ctx = append(ctx, fmt.Sprintf("L%d: %s — %s", m.line, m.desc, m.context))
+	}
+	*findings = append(*findings, Finding{
+		Severity:   severity,
+		Check:      "JS Injection",
+		Detail:     fmt.Sprintf("%s (confidence %d, %d signal(s))", strings.Join(ctx, " | "), score, signalCount(matches)),
+		File:       rel,
+		Line:       matches[0].line,
+		Confidence: score,
+		Signals:    signalCount(matches),
+	})
 }
 
 // ──────────────────────────────────────────────
@@ -472,13 +529,23 @@ func CheckMuPlugins(pubDir string, findings *[]Finding) {
 			// Scan content for malware
 			allPatterns := append(patterns, jsPatterns...)
 			matches := scanFileForPatterns(path, allPatterns)
-			for _, m := range matches {
+			if len(matches) > 0 {
+				score, severity := scoreMatches(matches)
+				ctx := make([]string, 0, 3)
+				for i, m := range matches {
+					if i >= 3 {
+						break
+					}
+					ctx = append(ctx, fmt.Sprintf("L%d: %s", m.line, m.desc))
+				}
 				*findings = append(*findings, Finding{
-					Severity: Critical,
-					Check:    "mu-plugins Malware",
-					Detail:   fmt.Sprintf("%s — %s", m.desc, m.context),
+					Severity:   severity,
+					Check:      "mu-plugins Malware",
+					Detail:     fmt.Sprintf("%s (confidence %d, %d signal(s))", strings.Join(ctx, " | "), score, signalCount(matches)),
+					Confidence: score,
+					Signals:    signalCount(matches),
 					File:     rel,
-					Line:     m.line,
+					Line:     matches[0].line,
 				})
 			}
 		}
@@ -645,9 +712,11 @@ func CheckDatabase(pubDir string, findings *[]Finding) {
 		outStr := string(out)
 		if strings.Contains(outStr, "match") && !strings.Contains(outStr, "0 matches") {
 			*findings = append(*findings, Finding{
-				Severity: Critical,
-				Check:    "Database Scan",
-				Detail:   fmt.Sprintf("Suspicious DB content: %s", pd.Desc),
+				Severity:   severityForWeight(pd.Weight),
+				Check:      "Database Scan",
+				Detail:     fmt.Sprintf("Suspicious DB content: %s", pd.Desc),
+				Confidence: pd.Weight,
+				Signals:    1,
 			})
 		}
 	}
@@ -771,6 +840,7 @@ func CheckPlugins(pubDir string, recentDays int, findings *[]Finding) {
 		// Malware pattern scan
 		matches := scanFileForPatterns(path, patterns)
 		if len(matches) > 0 {
+			score, severity := scoreMatches(matches)
 			ctx := make([]string, 0, 3)
 			for i, m := range matches {
 				if i >= 3 {
@@ -779,10 +849,13 @@ func CheckPlugins(pubDir string, recentDays int, findings *[]Finding) {
 				ctx = append(ctx, fmt.Sprintf("L%d: %s", m.line, m.desc))
 			}
 			*findings = append(*findings, Finding{
-				Severity: Critical,
-				Check:    "Plugin Malware",
-				Detail:   strings.Join(ctx, " | "),
-				File:     rel,
+				Severity:   severity,
+				Check:      "Plugin Malware",
+				Detail:     fmt.Sprintf("%s (confidence %d, %d signal(s))", strings.Join(ctx, " | "), score, signalCount(matches)),
+				File:       rel,
+				Line:       matches[0].line,
+				Confidence: score,
+				Signals:    signalCount(matches),
 			})
 		}
 		return nil
@@ -895,16 +968,44 @@ func CheckHighRiskPluginsAndSnippets(pubDir string, findings *[]Finding) {
 // CHECK: PHP payloads embedded inside real image files
 // ──────────────────────────────────────────────
 
-// imageMarkers are byte sequences that have no business appearing inside
-// a genuine JPG/PNG/GIF/ICO — unlike the disguised-file check above (which
-// only catches filename tricks like shell.php.jpg), this opens files that
-// pass a real image extension and looks for a payload appended or injected
-// into the file body itself.
-var imageMarkers = [][]byte{
-	[]byte("<?php"),
-	[]byte("<?="),
-	[]byte("eval("),
-	[]byte("base64_decode("),
+// imageMarker is a byte sequence with no business appearing inside a
+// genuine image, plus how much confidence weight it carries depending on
+// *where* it's found:
+//
+//   - inTrailer: found after the image's own legitimate end-of-file marker
+//     (JPEG EOI, PNG IEND, GIF trailer). Genuine images have nothing
+//     meaningful back there — this is the actual polyglot-file signature
+//     (e.g. valid JPEG bytes followed by an appended PHP payload), so it's
+//     weighted high.
+//   - inBody: found somewhere before that point. This is much weaker on
+//     its own — EXIF/IPTC/XMP metadata and ICC color profiles routinely
+//     carry arbitrary binary or tool-generated text, and a short sequence
+//     like "<?=" can turn up there by pure coincidence in a large enough
+//     file. Weighted low unless corroborated by another marker.
+type imageMarker struct {
+	bytes     []byte
+	inBody    int
+	inTrailer int
+}
+
+var imageMarkers = []imageMarker{
+	{bytes: []byte("<?php"), inBody: WeightMedium, inTrailer: WeightHigh},
+	{bytes: []byte("<?="), inBody: WeightLow, inTrailer: WeightMedium},
+	{bytes: []byte("eval("), inBody: WeightMedium, inTrailer: WeightHigh},
+	{bytes: []byte("base64_decode("), inBody: WeightMedium, inTrailer: WeightHigh},
+}
+
+// imageMagic maps a recognized extension to the real magic-byte header a
+// genuine file of that type starts with (GIF is checked separately since
+// it has two valid variants). A file can lie about its extension; it
+// can't lie about its own format's magic bytes without literally not
+// being that format — a mismatch here is a far more specific signal than
+// "some PHP-looking text appears somewhere in this file" ever is alone.
+var imageMagic = map[string][]byte{
+	".jpg":  {0xFF, 0xD8, 0xFF},
+	".jpeg": {0xFF, 0xD8, 0xFF},
+	".png":  {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A},
+	".ico":  {0x00, 0x00, 0x01, 0x00},
 }
 
 const maxImageScanSize = 20 * 1024 * 1024 // skip anything absurdly large
@@ -931,20 +1032,94 @@ func CheckImageEmbeddedPHP(pubDir string, findings *[]Finding) {
 		if err != nil {
 			return nil
 		}
-		for _, marker := range imageMarkers {
-			if bytes.Contains(data, marker) {
-				rel, _ := filepath.Rel(pubDir, path)
-				*findings = append(*findings, Finding{
-					Severity: Critical,
-					Check:    "Image Payload Scan",
-					Detail:   fmt.Sprintf("PHP code embedded inside image file (marker: %s) — valid extension, poisoned body", string(marker)),
-					File:     rel,
-				})
-				break
+		rel, _ := filepath.Rel(pubDir, path)
+
+		if !hasImageMagic(ext, data) {
+			// Extension says image, magic bytes say otherwise — this is
+			// structurally not the file type it claims to be, independent
+			// of whatever is or isn't found inside it. Always Critical:
+			// there's no ambiguity to grade here, unlike a byte-string
+			// match.
+			*findings = append(*findings, Finding{
+				Severity: Critical,
+				Check:    "Image Payload Scan",
+				Detail:   fmt.Sprintf("File has a %s extension but does not have a real %s header — not actually an image", ext, strings.ToUpper(strings.TrimPrefix(ext, "."))),
+				File:     rel,
+			})
+			return nil
+		}
+
+		trailerAt := imageTrailerEnd(ext, data)
+
+		score := 0
+		var hits []string
+		for _, m := range imageMarkers {
+			idx := bytes.Index(data, m.bytes)
+			if idx < 0 {
+				continue
+			}
+			if trailerAt >= 0 && idx >= trailerAt {
+				score += m.inTrailer
+				hits = append(hits, fmt.Sprintf("%s (after end-of-file marker)", string(m.bytes)))
+			} else {
+				score += m.inBody
+				hits = append(hits, string(m.bytes))
 			}
 		}
+
+		if score == 0 {
+			return nil
+		}
+
+		*findings = append(*findings, Finding{
+			Severity:   severityForScore(score),
+			Check:      "Image Payload Scan",
+			Detail:     fmt.Sprintf("Possible PHP payload inside image: %s (confidence %d)", strings.Join(hits, ", "), score),
+			File:       rel,
+			Confidence: score,
+			Signals:    len(hits),
+		})
 		return nil
 	})
+}
+
+// hasImageMagic reports whether data actually starts with the magic bytes
+// for ext, rather than trusting the filename.
+func hasImageMagic(ext string, data []byte) bool {
+	if ext == ".gif" {
+		return bytes.HasPrefix(data, []byte("GIF87a")) || bytes.HasPrefix(data, []byte("GIF89a"))
+	}
+	magic, ok := imageMagic[ext]
+	if !ok {
+		return true // unrecognized extension — shouldn't happen given imageExts, nothing to check
+	}
+	return bytes.HasPrefix(data, magic)
+}
+
+// imageTrailerEnd returns the byte offset right after the image's own
+// legitimate end-of-file marker (the *last* occurrence, in case
+// entropy-coded scan data coincidentally contains an earlier lookalike),
+// or -1 if none is found — e.g. a truncated file — in which case every
+// marker is treated as "in body" rather than assumed to be past a trailer
+// that may not actually exist.
+func imageTrailerEnd(ext string, data []byte) int {
+	switch ext {
+	case ".jpg", ".jpeg":
+		if i := bytes.LastIndex(data, []byte{0xFF, 0xD9}); i >= 0 {
+			return i + 2
+		}
+	case ".png":
+		if i := bytes.LastIndex(data, []byte("IEND")); i >= 0 {
+			if end := i + 4 + 4; end <= len(data) { // chunk type + CRC32
+				return end
+			}
+		}
+	case ".gif":
+		if i := bytes.LastIndexByte(data, 0x3B); i >= 0 {
+			return i + 1
+		}
+	}
+	return -1
 }
 
 // ──────────────────────────────────────────────
@@ -1051,6 +1226,7 @@ type matchResult struct {
 	line    int
 	desc    string
 	context string
+	weight  int
 }
 
 func scanFileForPatterns(path string, patterns []*compiledPattern) []matchResult {
@@ -1078,6 +1254,7 @@ func scanFileForPatterns(path string, patterns []*compiledPattern) []matchResult
 					line:    lineNum,
 					desc:    p.desc,
 					context: ctx,
+					weight:  p.weight,
 				})
 				break // one match per line is enough
 			}

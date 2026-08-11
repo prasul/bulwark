@@ -1,0 +1,7 @@
+# Machine-managed — regenerated weekly by `wpscan vulns update`, never hand-edited.
+cfg/vulnerabilities.wordfence.json
+
+# Local operator config — copy from the .example.json templates and edit;
+# not tracked by default since content may be site/incident specific.
+cfg/custom_patterns.json
+cfg/vulnerabilities.json

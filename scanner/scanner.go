@@ -10,6 +10,7 @@ import (
 // Scanner runs all WordPress security checks
 type Scanner struct {
 	Config Config
+	vulnDB []VulnEntry
 }
 
 func New(cfg Config) *Scanner {
@@ -29,6 +30,50 @@ func (s *Scanner) Run() (*ScanSummary, error) {
 
 	// Host-level checks run once for the whole box, not once per site.
 	CheckServerCron(&summary.HostFindings)
+
+	// Load operator-supplied config once per run: extra pattern signatures
+	// get merged straight into the built-in pattern lists, and the known-
+	// vulnerability lists (hand-curated + the weekly Wordfence cache) get
+	// held on the Scanner for CheckKnownVulnerabilities to consult per site.
+	// A missing file is fine — every one of these is optional. A present
+	// but malformed file is surfaced as a host-level Info finding instead
+	// of aborting the whole scan.
+	if err := loadCustomPatterns(s.Config.CustomPatternsPath); err != nil {
+		summary.HostFindings = append(summary.HostFindings, Finding{
+			Severity: Info,
+			Check:    "Custom Patterns",
+			Detail:   fmt.Sprintf("could not load %s: %v", s.Config.CustomPatternsPath, err),
+			File:     s.Config.CustomPatternsPath,
+		})
+	}
+
+	custom, err := loadVulnFile(s.Config.VulnConfigPath)
+	if err != nil {
+		summary.HostFindings = append(summary.HostFindings, Finding{
+			Severity: Info,
+			Check:    "Known Vulnerabilities",
+			Detail:   fmt.Sprintf("could not load %s: %v", s.Config.VulnConfigPath, err),
+			File:     s.Config.VulnConfigPath,
+		})
+	}
+
+	cached, err := loadVulnFile(s.Config.VulnCachePath)
+	if err != nil {
+		summary.HostFindings = append(summary.HostFindings, Finding{
+			Severity: Info,
+			Check:    "Known Vulnerabilities",
+			Detail:   fmt.Sprintf("could not load %s: %v (run `wpscan vulns update`?)", s.Config.VulnCachePath, err),
+			File:     s.Config.VulnCachePath,
+		})
+	}
+	s.vulnDB = append(custom, cached...)
+
+	// Filter host-level findings down to the configured floor now, before
+	// they're counted below — everything from here on (TotalIssues, the
+	// printed summary, the HTML report) reflects what's actually shown.
+	var hostHidden int
+	summary.HostFindings, hostHidden = filterBySeverity(summary.HostFindings, s.Config.MinSeverity)
+	summary.Hidden += hostHidden
 
 	entries, err := os.ReadDir(s.Config.BaseDir)
 	if err != nil {
@@ -50,6 +95,7 @@ func (s *Scanner) Run() (*ScanSummary, error) {
 
 		result := s.scanSite(domain, siteDir, pubDir)
 		summary.Sites = append(summary.Sites, result)
+		summary.Hidden += result.Hidden
 
 		if result.HasIssues {
 			summary.TotalIssues += len(result.Findings)
@@ -116,6 +162,9 @@ func (s *Scanner) scanSite(domain, siteDir, pubDir string) SiteResult {
 		{"Plugin Audit", func() {
 			CheckPlugins(pubDir, s.Config.RecentDays, &findings)
 		}},
+		{"Known Vulnerabilities", func() {
+			CheckKnownVulnerabilities(pubDir, s.vulnDB, &findings)
+		}},
 		{"Admin Users", func() {
 			CheckAdminUsers(pubDir, &findings)
 		}},
@@ -145,6 +194,11 @@ func (s *Scanner) scanSite(domain, siteDir, pubDir string) SiteResult {
 			}
 		}
 	}
+
+	// Apply the reporting floor last, after every check has had a chance to
+	// run and score its own findings — HasIssues/ChecksFailed are computed
+	// from what's actually kept, so they match what the report shows.
+	findings, result.Hidden = filterBySeverity(findings, s.Config.MinSeverity)
 
 	result.Findings = findings
 	for _, f := range findings {
